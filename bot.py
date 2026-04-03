@@ -1,41 +1,34 @@
-"""RoboKova Ultimate Bot — Exploits Every Mechanic
+"""RoboKova Self-Learning Bot — Gets Smarter Every Match
 
-KEY INSIGHTS THIS BOT USES:
-- COLLECT is the best action: costs 2 energy, returns 3 = NET +1 energy AND +10 score
-- Power-ups auto-collect on walk — route through them for free buffs
-- Damage boost stacking is OP: 2 stacks = 45 dmg/hit, farm boosts BEFORE fighting
-- Enemy last_action tells you what they'll likely do next
-- Enemy energy < 3 means they CANNOT attack you — free hits
-- Defending enemy = halved damage, WAIT a turn then hit
-- Farming resources > fighting for score (unless you can get kills)
-- Placement bonus is huge in big lobbies — survival matters most
+This bot uses reinforcement learning to improve over time:
+- Has ~15 tunable strategy "knobs" (weights)
+- Tracks performance each match (score, survival, damage)
+- After each match, adjusts weights toward what worked
+- Starts with solid defaults, then optimizes through experience
+
+The more matches it plays, the smarter it gets.
 
 Run: uvicorn bot:app --host 0.0.0.0 --port 5001 --reload
 """
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import random
+import time
 from typing import Any
 
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-app = FastAPI(title="RoboKova Ultimate Bot")
+app = FastAPI(title="RoboKova Learning Bot")
 
-BOT_ID = os.environ.get("BOT_ID", "ultimate")
+BOT_ID = os.environ.get("BOT_ID", "learner")
 BOT_COLOR = os.environ.get("BOT_COLOR", "#00d2ff")
 ARENA_URL = os.environ.get("ARENA_URL", "")
-
-# Per-match state tracking
-match_state: dict[str, Any] = {
-    "last_action": "",
-    "positions": [],          # anti-oscillation
-    "last_match": "",         # reset state between matches
-    "consecutive_waits": 0,   # avoid getting stuck waiting
-}
 
 
 class MoveResponse(BaseModel):
@@ -44,9 +37,243 @@ class MoveResponse(BaseModel):
     mood: str = ""
 
 
-# ===================================================================
-# UTILITY FUNCTIONS
-# ===================================================================
+# =====================================================================
+# LEARNABLE STRATEGY WEIGHTS — these evolve over matches
+# =====================================================================
+
+# Defaults are tuned to be decent out of the box
+strategy_weights = {
+    # Combat
+    "aggression": 0.45,            # 0=pacifist, 1=berserker
+    "flee_health_pct": 0.28,       # flee when HP below this % of 100
+    "defend_preference": 0.35,     # 0=never defend, 1=defend often
+    "kill_chase_value": 0.70,      # how eagerly to chase low-HP enemies
+    "helpless_enemy_bonus": 0.80,  # bonus for attacking energy-starved enemies
+    "wait_out_defense": 0.75,      # tendency to wait when enemy is defending
+
+    # Economy
+    "resource_priority": 0.80,     # how much to value resources
+    "energy_pack_priority": 0.85,  # priority for energy pack power-ups
+    "damage_boost_priority": 0.90, # priority for damage boost power-ups
+    "shield_priority": 0.75,       # priority for shield power-ups
+    "speed_priority": 0.50,        # priority for speed boost
+    "vision_priority": 0.25,       # priority for vision boost
+    "min_energy_reserve": 3.0,     # keep at least this much energy
+
+    # Survival
+    "survival_value": 0.65,        # 0=yolo, 1=hide-and-survive
+    "zone_prep_timing": 0.58,      # start moving to center at this % of match
+    "center_pull": 0.40,           # how strongly to prefer center positions
+}
+
+# Clamp ranges for each weight
+WEIGHT_BOUNDS = {
+    "aggression": (0.05, 0.95),
+    "flee_health_pct": (0.10, 0.50),
+    "defend_preference": (0.10, 0.80),
+    "kill_chase_value": (0.20, 0.95),
+    "helpless_enemy_bonus": (0.30, 0.95),
+    "wait_out_defense": (0.30, 0.95),
+    "resource_priority": (0.30, 0.95),
+    "energy_pack_priority": (0.40, 0.95),
+    "damage_boost_priority": (0.50, 0.99),
+    "shield_priority": (0.30, 0.95),
+    "speed_priority": (0.15, 0.80),
+    "vision_priority": (0.05, 0.60),
+    "min_energy_reserve": (1.0, 8.0),
+    "survival_value": (0.20, 0.90),
+    "zone_prep_timing": (0.40, 0.70),
+    "center_pull": (0.15, 0.75),
+}
+
+
+# =====================================================================
+# LEARNING ENGINE
+# =====================================================================
+
+LEARNING_RATE = 0.08
+EXPLORATION_NOISE = 0.03
+MIN_MATCHES_BEFORE_LEARNING = 3
+
+match_history: list[dict] = []  # stores results of completed matches
+current_match: dict = {}        # tracks the ongoing match
+
+# Stats display
+total_matches = 0
+total_wins = 0
+
+
+def start_new_match(match_id: str, weights_snapshot: dict):
+    """Initialize tracking for a new match."""
+    global current_match
+    current_match = {
+        "match_id": match_id,
+        "weights_used": dict(weights_snapshot),
+        "start_time": time.time(),
+        "turns_played": 0,
+        "total_score_gained": 0,
+        "total_damage_dealt": 0,
+        "total_damage_taken": 0,
+        "resources_collected": 0,
+        "kills": 0,
+        "last_health": 100,
+        "last_score": 0,
+        "last_energy": 20,
+        "survived": True,
+        "final_score": 0,
+        "max_turns": 100,
+        "num_bots": 2,
+    }
+
+
+def track_turn(state: dict):
+    """Track changes between turns for reward calculation."""
+    me = state["self"]
+    hp = me["health"]
+    score = me["score"]
+
+    score_gained = max(0, score - current_match.get("last_score", 0))
+    damage_taken = max(0, current_match.get("last_health", 100) - hp)
+
+    current_match["turns_played"] += 1
+    current_match["total_score_gained"] += score_gained
+    current_match["total_damage_taken"] += damage_taken
+    current_match["last_health"] = hp
+    current_match["last_score"] = score
+    current_match["last_energy"] = me["energy"]
+    current_match["final_score"] = score
+    current_match["max_turns"] = state["max_turns"]
+    current_match["num_bots"] = state.get("num_bots", 2)
+
+    # Detect kills from score jumps (kill = +30 score spike)
+    if score_gained >= 30:
+        current_match["kills"] += score_gained // 30
+
+    # Detect resource collection from score jumps
+    if score_gained >= 10 and score_gained < 30:
+        current_match["resources_collected"] += 1
+
+
+def finish_match():
+    """Evaluate completed match and learn from it."""
+    global total_matches, total_wins
+
+    if not current_match.get("match_id"):
+        return
+
+    total_matches += 1
+
+    # Calculate match reward
+    reward = calculate_reward(current_match)
+    current_match["reward"] = reward
+
+    match_history.append(dict(current_match))
+
+    # Learn from history
+    if len(match_history) >= MIN_MATCHES_BEFORE_LEARNING:
+        learn_from_history()
+
+    # Track wins (heuristic: survived with high score)
+    if current_match.get("survived", False):
+        total_wins += 1
+
+
+def calculate_reward(match: dict) -> float:
+    """Calculate a single reward score for the match."""
+    reward = 0.0
+
+    # Core: final score is the main signal
+    reward += match["final_score"] * 1.0
+
+    # Survival bonus (big — placement bonus is huge)
+    turns_pct = match["turns_played"] / max(1, match["max_turns"])
+    reward += turns_pct * 50  # surviving longer = good
+
+    # Full survival bonus
+    if match.get("survived", False) and match["last_health"] > 0:
+        reward += 40
+
+    # Efficiency: score per damage taken
+    if match["total_damage_taken"] > 0:
+        efficiency = match["total_score_gained"] / match["total_damage_taken"]
+        reward += min(efficiency * 10, 30)  # cap it
+    elif match["total_score_gained"] > 0:
+        reward += 30  # took no damage but scored — perfect
+
+    # Kill bonus
+    reward += match["kills"] * 15
+
+    # Penalty for dying early
+    if match["last_health"] <= 0 or (not match.get("survived", True)):
+        early_death_penalty = (1 - turns_pct) * 60
+        reward -= early_death_penalty
+
+    # Scale by number of bots (harder matches = more reward)
+    bot_multiplier = 1.0 + (match.get("num_bots", 2) - 2) * 0.1
+    reward *= bot_multiplier
+
+    return reward
+
+
+def learn_from_history():
+    """Adjust strategy weights based on match results."""
+    global strategy_weights
+
+    if len(match_history) < MIN_MATCHES_BEFORE_LEARNING:
+        return
+
+    # Compare recent matches to running average
+    recent = match_history[-1]
+    avg_reward = sum(m["reward"] for m in match_history) / len(match_history)
+    recent_reward = recent["reward"]
+
+    # How much better/worse than average
+    advantage = (recent_reward - avg_reward) / max(abs(avg_reward), 1.0)
+    # Clamp advantage to prevent wild swings
+    advantage = max(-1.0, min(1.0, advantage))
+
+    # Get the weights used in the recent match
+    used_weights = recent.get("weights_used", {})
+
+    for key in strategy_weights:
+        if key not in used_weights:
+            continue
+
+        current = strategy_weights[key]
+        used = used_weights[key]
+
+        # Direction: if match was good, move toward used value
+        # If match was bad, move away from used value
+        diff = used - current
+        nudge = LEARNING_RATE * advantage * (1 + abs(diff))
+
+        # Apply update
+        new_val = current + nudge
+
+        # Add exploration noise (decreases over time)
+        noise_scale = EXPLORATION_NOISE * max(0.3, 1.0 - len(match_history) / 100)
+        new_val += random.gauss(0, noise_scale)
+
+        # Clamp to valid range
+        lo, hi = WEIGHT_BOUNDS.get(key, (0.0, 1.0))
+        strategy_weights[key] = max(lo, min(hi, new_val))
+
+
+def get_active_weights() -> dict:
+    """Get current weights with slight exploration noise for this match."""
+    w = dict(strategy_weights)
+    # Small per-match exploration
+    if len(match_history) < 30:
+        for key in w:
+            lo, hi = WEIGHT_BOUNDS.get(key, (0.0, 1.0))
+            noise = random.gauss(0, EXPLORATION_NOISE * 0.5)
+            w[key] = max(lo, min(hi, w[key] + noise))
+    return w
+
+
+# =====================================================================
+# GAME UTILITIES (same solid foundation as before)
+# =====================================================================
 
 def manhattan(x1: int, y1: int, x2: int, y2: int) -> int:
     return abs(x1 - x2) + abs(y1 - y2)
@@ -79,7 +306,7 @@ def apply_move(x: int, y: int, action: str) -> tuple[int, int]:
     return (x, y)
 
 
-def is_valid_pos(x: int, y: int, arena_size: int, walls: set) -> bool:
+def is_valid(x: int, y: int, arena_size: int, walls: set) -> bool:
     return 0 <= x < arena_size and 0 <= y < arena_size and (x, y) not in walls
 
 
@@ -90,287 +317,178 @@ def get_walls(tiles: list[dict]) -> set[tuple[int, int]]:
     return {(t["x"], t["y"]) for t in tiles if t.get("type") == "wall"}
 
 
-def get_enemy_positions(enemies: list[dict]) -> set[tuple[int, int]]:
-    return {(e["x"], e["y"]) for e in enemies}
-
-
-# ===================================================================
-# SMART MOVEMENT — avoids walls, enemies, oscillation, danger zone
-# ===================================================================
-
-def score_move(nx: int, ny: int, target_x: int, target_y: int,
-               arena_size: int, safe_radius: int, enemies: list[dict],
-               avoid_enemies: bool, positions: list) -> float:
-    """Score a potential move position. Higher = better."""
-    score = 0.0
-
-    # Distance to target (closer = better)
-    old_dist = manhattan(target_x, target_y, target_x, target_y)  # irrelevant
-    new_dist = manhattan(nx, ny, target_x, target_y)
-    score -= new_dist * 3
-
-    # Stay in safe zone
-    if is_in_safe_zone(nx, ny, arena_size, safe_radius):
-        score += 10
-    else:
-        score -= 20
-
-    # Avoid enemies if requested
-    if avoid_enemies:
-        for e in enemies:
-            d = chebyshev(nx, ny, e["x"], e["y"])
-            if d <= 1:
-                score -= 30  # very bad — adjacent
-            elif d <= 2:
-                score -= 10
-
-    # Anti-oscillation
-    if (nx, ny) in positions[-4:]:
-        score -= 15
-
-    # Slight center preference
-    score -= dist_from_center(nx, ny, arena_size) * 0.5
-
-    return score
-
-
-def best_move_toward(my_x: int, my_y: int, tx: int, ty: int,
-                     arena_size: int, walls: set, safe_radius: int,
-                     enemies: list[dict], avoid_enemies: bool = False) -> str | None:
-    """Find best move toward target considering all factors."""
+def smart_move(my_x: int, my_y: int, tx: int, ty: int,
+               arena_size: int, walls: set, safe_radius: int,
+               enemies: list[dict], avoid_enemies: bool,
+               positions: list, center_w: float) -> str | None:
+    """Unified smart movement considering all factors."""
     best_action = None
     best_score = -9999
 
     for action in ALL_MOVES:
         nx, ny = apply_move(my_x, my_y, action)
-        if not is_valid_pos(nx, ny, arena_size, walls):
+        if not is_valid(nx, ny, arena_size, walls):
             continue
 
-        score = score_move(nx, ny, tx, ty, arena_size, safe_radius,
-                           enemies, avoid_enemies, match_state["positions"])
+        s = 0.0
+        # Progress toward target
+        old_d = manhattan(my_x, my_y, tx, ty)
+        new_d = manhattan(nx, ny, tx, ty)
+        s += (old_d - new_d) * 8
 
-        # Bonus for actually getting closer to target
-        old_dist = manhattan(my_x, my_y, tx, ty)
-        new_dist = manhattan(nx, ny, tx, ty)
-        score += (old_dist - new_dist) * 5
+        # Safe zone
+        if is_in_safe_zone(nx, ny, arena_size, safe_radius):
+            s += 8
+        else:
+            s -= 18
 
-        if score > best_score:
-            best_score = score
+        # Enemy avoidance
+        if avoid_enemies:
+            for e in enemies:
+                d = chebyshev(nx, ny, e["x"], e["y"])
+                if d <= 1: s -= 25
+                elif d <= 2: s -= 8
+
+        # Anti-oscillation
+        if (nx, ny) in positions[-3:]: s -= 18
+        elif (nx, ny) in positions[-6:]: s -= 8
+
+        # Center pull (learnable)
+        s -= dist_from_center(nx, ny, arena_size) * center_w
+
+        if s > best_score:
+            best_score = s
             best_action = action
 
     return best_action
 
 
-def best_flee_move(my_x: int, my_y: int, enemies: list[dict],
-                   arena_size: int, walls: set, safe_radius: int) -> str | None:
-    """Find best escape direction — maximize distance from all enemies."""
+def flee_move(my_x: int, my_y: int, enemies: list[dict],
+              arena_size: int, walls: set, safe_radius: int,
+              positions: list) -> str | None:
+    """Best escape direction."""
     best_action = None
     best_score = -9999
 
     for action in ALL_MOVES:
         nx, ny = apply_move(my_x, my_y, action)
-        if not is_valid_pos(nx, ny, arena_size, walls):
+        if not is_valid(nx, ny, arena_size, walls):
             continue
 
-        score = 0.0
+        s = 0.0
         for e in enemies:
             old_d = chebyshev(my_x, my_y, e["x"], e["y"])
             new_d = chebyshev(nx, ny, e["x"], e["y"])
-            score += (new_d - old_d) * 15
+            s += (new_d - old_d) * 15
 
         if is_in_safe_zone(nx, ny, arena_size, safe_radius):
-            score += 10
+            s += 10
         else:
-            score -= 25
+            s -= 22
 
-        if (nx, ny) in match_state["positions"][-4:]:
-            score -= 12
+        if (nx, ny) in positions[-4:]:
+            s -= 12
 
-        score -= dist_from_center(nx, ny, arena_size)
+        s -= dist_from_center(nx, ny, arena_size) * 0.5
 
-        if score > best_score:
-            best_score = score
+        if s > best_score:
+            best_score = s
             best_action = action
 
     return best_action
 
 
-def move_to_center(my_x: int, my_y: int, arena_size: int, walls: set,
-                   safe_radius: int, enemies: list[dict]) -> str | None:
-    cx, cy = int(center_of(arena_size)[0]), int(center_of(arena_size)[1])
-    return best_move_toward(my_x, my_y, cx, cy, arena_size, walls,
-                            safe_radius, enemies, avoid_enemies=True)
+# =====================================================================
+# COMBAT INTELLIGENCE (uses learned weights)
+# =====================================================================
 
-
-# ===================================================================
-# GAME PHASE
-# ===================================================================
-
-def get_phase(turn: int, max_turns: int) -> str:
-    pct = turn / max_turns
-    if pct < 0.30:
-        return "early"
-    elif pct < 0.65:
-        return "mid"
-    return "late"
-
-
-def zone_is_shrinking(turn: int, max_turns: int) -> bool:
-    return turn >= max_turns * 0.7
-
-
-def zone_about_to_shrink(turn: int, max_turns: int) -> bool:
-    """Returns True when we should start moving to center."""
-    return turn >= max_turns * 0.55
-
-
-# ===================================================================
-# COMBAT INTELLIGENCE
-# ===================================================================
-
-def my_attack_damage(me: dict) -> int:
-    """Calculate our actual attack damage with buffs."""
+def my_damage(me: dict) -> int:
     stacks = me.get("damage_boost_stacks", 0)
     return 15 * (1 + stacks)
 
 
-def effective_damage_to(me: dict, enemy: dict) -> int:
-    """Damage we'd actually deal to this specific enemy."""
-    dmg = my_attack_damage(me)
+def effective_dmg(me: dict, enemy: dict) -> int:
+    d = my_damage(me)
     if enemy.get("is_defending"):
-        dmg = dmg // 2
-    return dmg
-
-
-def hits_to_kill(me: dict, enemy: dict) -> int:
-    """How many attacks to eliminate this enemy."""
-    dmg = effective_damage_to(me, enemy)
-    if dmg <= 0:
-        return 999
-    return max(1, -(-enemy["health"] // dmg))  # ceiling division
-
-
-def energy_to_kill(me: dict, enemy: dict) -> int:
-    """Energy needed to kill this enemy (attacks only)."""
-    return hits_to_kill(me, enemy) * 3
+        d //= 2
+    return d
 
 
 def can_one_shot(me: dict, enemy: dict) -> bool:
-    return effective_damage_to(me, enemy) >= enemy["health"]
+    return effective_dmg(me, enemy) >= enemy["health"]
 
 
-def enemy_can_attack(enemy: dict) -> bool:
-    return enemy.get("energy", 0) >= 3
-
-
-def enemy_is_helpless(enemy: dict) -> bool:
-    """Enemy can't attack AND can't flee effectively."""
-    return enemy.get("energy", 0) < 1
-
-
-def enemy_just_defended(enemy: dict) -> bool:
-    return enemy.get("last_action") == "DEFEND"
-
-
-def should_attack_enemy(me: dict, enemy: dict, adjacent_count: int, phase: str) -> bool:
-    """Smart combat decision — should we attack this enemy?"""
+def should_fight(me: dict, enemy: dict, adjacent_count: int,
+                 phase: str, w: dict) -> bool:
+    """Learned combat decision."""
     my_hp = me["health"]
-    my_energy = me["energy"]
-    my_dmg = effective_damage_to(me, enemy)
+    my_nrg = me["energy"]
     en_hp = enemy["health"]
+    en_nrg = enemy.get("energy", 10)
+    my_dmg = effective_dmg(me, enemy)
 
-    # ALWAYS finish off one-shottable enemies
+    # ALWAYS finish kills
     if en_hp <= my_dmg:
         return True
 
-    # DON'T attack defending enemies without damage boost (waste of energy)
+    # Don't attack defending enemies without boost
     if enemy.get("is_defending") and me.get("damage_boost_stacks", 0) == 0:
-        return False
+        if w["wait_out_defense"] > 0.5:
+            return False
 
-    # Enemy can't attack — free hits!
-    if not enemy_can_attack(enemy):
+    # Enemy can't fight back — learned bonus
+    if en_nrg < 3:
+        return random.random() < w["helpless_enemy_bonus"]
+
+    # Base aggression check
+    fight_score = w["aggression"]
+
+    # Modify by situation
+    if my_hp > en_hp: fight_score += 0.15
+    if my_nrg > en_nrg: fight_score += 0.10
+    if me.get("damage_boost_stacks", 0) >= 1: fight_score += 0.20
+    if me.get("shield_charges", 0) >= 1: fight_score += 0.15
+    if adjacent_count >= 2: fight_score -= 0.30
+    if my_hp < 40: fight_score -= 0.25
+    if my_nrg < 6: fight_score -= 0.20
+    if phase == "late": fight_score += 0.10 * (1 - w["survival_value"])
+
+    return fight_score > 0.50
+
+
+def should_flee(me: dict, adjacent: list[dict], w: dict) -> bool:
+    hp_pct = me["health"] / 100
+    if hp_pct <= w["flee_health_pct"]:
         return True
-
-    # We have significant damage boost — press the advantage
-    if me.get("damage_boost_stacks", 0) >= 2:
+    if len(adjacent) >= 2 and hp_pct < w["flee_health_pct"] + 0.20:
         return True
-
-    # We have shields — can absorb hits
-    if me.get("shield_charges", 0) >= 1 and my_energy >= 6:
+    if me["health"] < 45 and me["energy"] < w["min_energy_reserve"] + 1:
         return True
-
-    # Outnumbered — don't engage
-    if adjacent_count >= 2:
-        return False
-
-    # We're healthier and have more energy — favorable fight
-    if my_hp > en_hp and my_energy > enemy.get("energy", 0) and my_energy >= 6:
-        return True
-
-    # Late game and we need points — be more aggressive
-    if phase == "late" and my_hp > 40 and my_energy >= 6:
-        return True
-
-    # Default: don't fight
     return False
 
 
-def should_flee(me: dict, adjacent: list[dict], phase: str) -> bool:
-    """Should we run away?"""
-    hp = me["health"]
-    energy = me["energy"]
+# =====================================================================
+# TARGET SCORING (uses learned weights)
+# =====================================================================
 
-    # Critical health — always flee
-    if hp <= 15:
-        return True
-
-    # Low health and no shields
-    if hp <= 30 and me.get("shield_charges", 0) == 0:
-        return True
-
-    # Outnumbered with moderate health
-    if len(adjacent) >= 2 and hp < 60:
-        return True
-
-    # Low health AND low energy — can't fight back
-    if hp < 45 and energy < 4:
-        return True
-
-    # All adjacent enemies have higher HP and can attack
-    if all(e["health"] > hp and enemy_can_attack(e) for e in adjacent):
-        if me.get("damage_boost_stacks", 0) == 0:
-            return True
-
-    return False
-
-
-# ===================================================================
-# TARGET SCORING — what's worth going after
-# ===================================================================
-
-def score_collectible(tile: dict, my_x: int, my_y: int, energy: int,
-                      health: int, me: dict, phase: str,
-                      arena_size: int, safe_radius: int) -> float:
-    """Score a tile with resource or power-up. Higher = go get it."""
+def score_target(tile: dict, my_x: int, my_y: int, energy: int,
+                 health: int, me: dict, phase: str,
+                 arena_size: int, safe_radius: int, w: dict) -> float:
     tx, ty = tile["x"], tile["y"]
     dist = manhattan(my_x, my_y, tx, ty)
 
-    # Energy budget: can we afford the round trip?
     if tile.get("has_resource"):
-        # Need: dist moves (1 each) + 1 COLLECT (2 energy) = dist + 2
-        # But COLLECT returns 3, so net cost = dist + 2 - 3 = dist - 1
         if energy < dist + 2:
             return -1
     elif tile.get("power_up"):
-        # Power-ups auto-collect on walk, just need to move there
-        if energy < dist:
+        if energy < max(1, dist):
             return -1
     else:
         return -1
 
-    # Don't go outside safe zone for anything in late game
+    # Don't chase things outside safe zone in late game
     if not is_in_safe_zone(tx, ty, arena_size, safe_radius):
-        if zone_about_to_shrink(0, 1):  # checked elsewhere; penalize here
+        if phase == "late":
             return -1
 
     score = 0.0
@@ -378,106 +496,48 @@ def score_collectible(tile: dict, my_x: int, my_y: int, energy: int,
     if tile.get("power_up"):
         pu = tile["power_up"]
         if pu == "damage_boost":
-            score = 40  # ALWAYS worth it — stacking is OP
-            score += me.get("damage_boost_stacks", 0) * 5  # more stacks = even better
+            score = 20 + w["damage_boost_priority"] * 30
         elif pu == "shield":
-            score = 35
-            if health < 50:
-                score += 15
+            score = 15 + w["shield_priority"] * 25
+            if health < 50: score += 12
         elif pu == "energy_pack":
-            score = 30
-            if energy < 10:
-                score += 20  # critical when low
+            score = 15 + w["energy_pack_priority"] * 25
+            if energy < 10: score += 18
         elif pu == "speed_boost":
-            score = 22
+            score = 10 + w["speed_priority"] * 20
         elif pu == "vision_boost":
-            score = 12
+            score = 5 + w["vision_priority"] * 15
     elif tile.get("has_resource"):
-        # Resources are incredible: +10 score, net +1 energy
-        score = 20
-        if energy < 10:
-            score += 10  # energy refund matters more when low
-        if phase == "early":
-            score += 5  # farming is king early
+        score = 10 + w["resource_priority"] * 20
+        if energy < 10: score += 8
+        if phase == "early": score += 5
 
-    # Closer targets are better (distance penalty)
-    score -= dist * 3
+    score -= dist * 2.5
 
-    # Prefer targets in safe zone
     if is_in_safe_zone(tx, ty, arena_size, safe_radius):
-        score += 5
+        score += 4
 
     return score
 
 
-# ===================================================================
-# EXPLORATION — smart wandering when nothing else to do
-# ===================================================================
-
-def explore_move(my_x: int, my_y: int, arena_size: int, walls: set,
-                 safe_radius: int, enemies: list[dict]) -> str | None:
-    """Wander intelligently — avoid oscillation, prefer safe zone, vary direction."""
-    candidates = []
-
-    for action in ALL_MOVES:
-        nx, ny = apply_move(my_x, my_y, action)
-        if not is_valid_pos(nx, ny, arena_size, walls):
-            continue
-
-        score = 0.0
-        # Avoid recent positions heavily
-        positions = match_state["positions"]
-        if (nx, ny) in positions[-3:]:
-            score -= 20
-        if (nx, ny) in positions[-6:]:
-            score -= 10
-
-        # Stay in safe zone
-        if is_in_safe_zone(nx, ny, arena_size, safe_radius):
-            score += 8
-        else:
-            score -= 15
-
-        # Slight center pull
-        score -= dist_from_center(nx, ny, arena_size) * 0.5
-
-        # Avoid enemies while exploring
-        for e in enemies:
-            if chebyshev(nx, ny, e["x"], e["y"]) <= 2:
-                score -= 10
-
-        # Randomness to avoid patterns
-        score += random.random() * 5
-
-        candidates.append((score, action))
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-    return None
-
-
-# ===================================================================
+# =====================================================================
 # MAIN DECISION ENGINE
-# ===================================================================
+# =====================================================================
+
+# Per-match tracking
+positions: list[tuple[int, int]] = []
+prev_action: str = ""
+consecutive_waits: int = 0
+active_weights: dict = {}
+
 
 def choose_action(state: dict[str, Any]) -> MoveResponse:
-    global match_state
-
-    # Reset state for new match
-    if state["match_id"] != match_state.get("last_match"):
-        match_state = {
-            "last_action": "",
-            "positions": [],
-            "last_match": state["match_id"],
-            "consecutive_waits": 0,
-        }
+    global positions, prev_action, consecutive_waits, active_weights
 
     me = state["self"]
     my_x, my_y = me["x"], me["y"]
     energy = me["energy"]
     health = me["health"]
-    score = me["score"]
     turn = state["turn"]
     max_turns = state["max_turns"]
     arena_size = state["arena_size"]
@@ -487,206 +547,247 @@ def choose_action(state: dict[str, Any]) -> MoveResponse:
     tiles = state.get("visible_tiles", [])
     dmg_stacks = me.get("damage_boost_stacks", 0)
     shields = me.get("shield_charges", 0)
-    speed = me.get("speed_boost_turns", 0)
 
-    phase = get_phase(turn, max_turns)
+    # Use active learned weights
+    w = active_weights
+
+    phase_pct = turn / max_turns
+    if phase_pct < 0.30: phase = "early"
+    elif phase_pct < 0.65: phase = "mid"
+    else: phase = "late"
+
     walls = get_walls(tiles)
-    enemy_pos = get_enemy_positions(enemies)
     in_safe = is_in_safe_zone(my_x, my_y, arena_size, safe_radius)
 
-    # Track positions
-    match_state["positions"].append((my_x, my_y))
-    if len(match_state["positions"]) > 12:
-        match_state["positions"].pop(0)
+    positions.append((my_x, my_y))
+    if len(positions) > 12:
+        positions.pop(0)
 
-    prev_action = match_state["last_action"]
-
-    # Categorize enemies by distance
     adjacent = [e for e in enemies if chebyshev(my_x, my_y, e["x"], e["y"]) <= 1]
     nearby = [e for e in enemies if 1 < chebyshev(my_x, my_y, e["x"], e["y"]) <= 3]
-    all_close = adjacent + nearby
 
-    # Find collectibles
+    on_resource = any(t.get("has_resource") and t["x"] == my_x and t["y"] == my_y for t in tiles)
+
     resources = [t for t in tiles if t.get("has_resource") and not (t["x"] == my_x and t["y"] == my_y)]
     power_ups = [t for t in tiles if t.get("power_up") and not (t["x"] == my_x and t["y"] == my_y)]
-    on_resource = any(
-        t.get("has_resource") and t["x"] == my_x and t["y"] == my_y for t in tiles
-    )
-    on_powerup = any(
-        t.get("power_up") and t["x"] == my_x and t["y"] == my_y for t in tiles
-    )
     all_targets = resources + power_ups
 
-    my_dmg = my_attack_damage(me)
+    my_dmg = my_damage(me)
+    center_w = w.get("center_pull", 0.4)
+    min_energy = w.get("min_energy_reserve", 3)
 
     def respond(action: str, emoji: str, mood: str) -> MoveResponse:
-        match_state["last_action"] = action
+        global prev_action, consecutive_waits
+        prev_action = action
         if action == "WAIT":
-            match_state["consecutive_waits"] += 1
+            consecutive_waits += 1
         else:
-            match_state["consecutive_waits"] = 0
+            consecutive_waits = 0
         return MoveResponse(action=action, emoji=emoji, mood=mood)
 
-    # ==============================================================
-    # 1. ALWAYS COLLECT if standing on resource (it's FREE energy + score!)
-    #    This is the single best action in the game: net +1 energy, +10 score
-    # ==============================================================
+    # ============================================================
+    # 1. ALWAYS COLLECT on resource (best action in the game!)
+    # ============================================================
     if on_resource and energy >= 2:
         return respond("COLLECT", "💰", "farming")
 
-    # ==============================================================
-    # 2. DANGER ZONE — get to safety immediately
-    # ==============================================================
-    if not in_safe:
-        if zone_is_shrinking(turn, max_turns):
-            action = move_to_center(my_x, my_y, arena_size, walls, safe_radius, enemies)
-            if action and energy >= 1:
-                return respond(action, "🏃", "escaping zone")
-        elif zone_about_to_shrink(turn, max_turns):
-            # Start moving toward center preemptively
-            center_dist = dist_from_center(my_x, my_y, arena_size)
-            if center_dist > safe_radius + 2:
-                action = move_to_center(my_x, my_y, arena_size, walls, safe_radius, enemies)
-                if action and energy >= 1:
-                    return respond(action, "🏃", "pre-positioning")
+    # ============================================================
+    # 2. DANGER ZONE — escape or pre-position
+    # ============================================================
+    if not in_safe and phase_pct >= w.get("zone_prep_timing", 0.55):
+        cx, cy = int(center_of(arena_size)[0]), int(center_of(arena_size)[1])
+        action = smart_move(my_x, my_y, cx, cy, arena_size, walls,
+                            safe_radius, enemies, True, positions, center_w)
+        if action and energy >= 1:
+            return respond(action, "🏃", "zone escape")
 
-    # ==============================================================
-    # 3. EMERGENCY — critical health, run or defend
-    # ==============================================================
-    if adjacent and should_flee(me, adjacent, phase):
-        # Can we one-shot someone on the way out? Free 30 pts!
+    # ============================================================
+    # 3. FLEE when in danger
+    # ============================================================
+    if adjacent and should_flee(me, adjacent, w):
+        # Parting shot if can one-shot
         killable = [e for e in adjacent if can_one_shot(me, e)]
         if killable and energy >= 3:
-            return respond("ATTACK", "💀", "parting gift")
+            return respond("ATTACK", "💀", "parting kill")
 
-        # Shield up if very low
-        if health <= 20 and energy >= 2 and shields == 0:
-            return respond("DEFEND", "🛡️", "last stand")
+        # Defend or flee based on learned preference
+        if health <= 20 and energy >= 2 and w["defend_preference"] > 0.5:
+            return respond("DEFEND", "🛡️", "emergency shield")
 
-        # RUN
-        action = best_flee_move(my_x, my_y, enemies, arena_size, walls, safe_radius)
+        action = flee_move(my_x, my_y, enemies, arena_size, walls, safe_radius, positions)
         if action and energy >= 1:
-            return respond(action, "💨", "retreating")
+            return respond(action, "💨", "retreat")
 
-    # ==============================================================
-    # 4. FINISH OFF — always take free kills (+30 score!)
-    # ==============================================================
+    # ============================================================
+    # 4. ALWAYS take free kills
+    # ============================================================
     if adjacent and energy >= 3:
         killable = [e for e in adjacent if can_one_shot(me, e)]
         if killable:
             return respond("ATTACK", "💀", "executing")
 
-    # ==============================================================
-    # 5. SMART COMBAT — attack only with clear advantage
-    # ==============================================================
+    # ============================================================
+    # 5. HIT & RUN — if just attacked, flee
+    # ============================================================
+    if prev_action == "ATTACK" and adjacent and energy >= 1:
+        action = flee_move(my_x, my_y, enemies, arena_size, walls, safe_radius, positions)
+        if action:
+            return respond(action, "💨", "hit and run")
+
+    # ============================================================
+    # 6. SMART COMBAT — fight with learned aggression
+    # ============================================================
     if adjacent and energy >= 4:
         for enemy in adjacent:
-            if should_attack_enemy(me, enemy, len(adjacent), phase):
-                # If we just attacked, flee instead (hit & run)
-                if prev_action == "ATTACK" and not can_one_shot(me, enemy):
-                    action = best_flee_move(my_x, my_y, enemies, arena_size, walls, safe_radius)
-                    if action:
-                        return respond(action, "💨", "hit and run")
-
-                # If enemy is defending RIGHT NOW, wait a turn
-                if enemy.get("is_defending") and dmg_stacks == 0:
+            if should_fight(me, enemy, len(adjacent), phase, w):
+                # Wait out defense if learned to do so
+                if enemy.get("is_defending") and w["wait_out_defense"] > 0.5 and dmg_stacks == 0:
                     return respond("WAIT", "⏳", "waiting out defense")
 
                 return respond("ATTACK", "⚔️", "calculated strike")
 
-    # If adjacent enemies but we chose not to fight — disengage
-    if adjacent and energy >= 1:
-        if not any(should_attack_enemy(me, e, len(adjacent), phase) for e in adjacent):
-            action = best_flee_move(my_x, my_y, enemies, arena_size, walls, safe_radius)
+        # Not worth fighting — disengage
+        if energy >= 1:
+            action = flee_move(my_x, my_y, enemies, arena_size, walls, safe_radius, positions)
             if action:
-                return respond(action, "💨", "disengaging")
+                return respond(action, "💨", "disengage")
 
-    # ==============================================================
-    # 6. CHASE BEST TARGET — score and route to best collectible
-    # ==============================================================
+    # ============================================================
+    # 7. CHASE TARGETS — scored by learned priorities
+    # ============================================================
     if all_targets and energy >= 2:
         scored = []
         for t in all_targets:
-            s = score_collectible(t, my_x, my_y, energy, health, me, phase,
-                                  arena_size, safe_radius)
+            s = score_target(t, my_x, my_y, energy, health, me, phase,
+                             arena_size, safe_radius, w)
             if s > 0:
                 scored.append((s, t))
         scored.sort(key=lambda x: x[0], reverse=True)
 
         if scored:
             best = scored[0][1]
-            avoid = health < 50  # avoid enemies when hurt
-            action = best_move_toward(my_x, my_y, best["x"], best["y"],
-                                      arena_size, walls, safe_radius,
-                                      enemies, avoid_enemies=avoid)
+            avoid = health < 50 and w["survival_value"] > 0.4
+            action = smart_move(my_x, my_y, best["x"], best["y"],
+                                arena_size, walls, safe_radius,
+                                enemies, avoid, positions, center_w)
             if action:
                 label = best.get("power_up", "resource")
                 return respond(action, "🎯", f"hunting {label}")
 
-    # ==============================================================
-    # 7. HUNT WOUNDED ENEMIES — stalk and finish off
-    # ==============================================================
-    if phase in ("mid", "late") and energy >= 6 and health > 50:
-        # Only hunt if we have damage advantage
+    # ============================================================
+    # 8. HUNT WOUNDED (based on learned chase value)
+    # ============================================================
+    if nearby and energy >= 6 and health > 50:
         huntable = [e for e in nearby
                     if e["health"] < health
-                    and e["health"] <= my_dmg * 3
-                    and (not enemy_can_attack(e) or dmg_stacks >= 1)]
-        if huntable:
+                    and e["health"] <= my_dmg * 3]
+        if huntable and random.random() < w["kill_chase_value"]:
             target = min(huntable, key=lambda e: e["health"])
-            action = best_move_toward(my_x, my_y, target["x"], target["y"],
-                                      arena_size, walls, safe_radius, enemies)
+            action = smart_move(my_x, my_y, target["x"], target["y"],
+                                arena_size, walls, safe_radius,
+                                enemies, False, positions, center_w)
             if action:
-                return respond(action, "🐺", "stalking")
+                return respond(action, "🐺", "hunting enemy")
 
-    # ==============================================================
-    # 8. LATE GAME POSITIONING — stay near center, stay alive
-    # ==============================================================
+    # ============================================================
+    # 9. LATE GAME CENTER
+    # ============================================================
     if phase == "late":
-        center_dist = dist_from_center(my_x, my_y, arena_size)
-        if center_dist > max(1, safe_radius * 0.4) and energy >= 1:
-            action = move_to_center(my_x, my_y, arena_size, walls, safe_radius, enemies)
+        cd = dist_from_center(my_x, my_y, arena_size)
+        if cd > max(1, safe_radius * 0.4) and energy >= 1:
+            cx, cy = int(center_of(arena_size)[0]), int(center_of(arena_size)[1])
+            action = smart_move(my_x, my_y, cx, cy, arena_size, walls,
+                                safe_radius, enemies, True, positions, center_w)
             if action:
                 return respond(action, "🏠", "centering")
 
-    # ==============================================================
-    # 9. ENERGY MANAGEMENT — rest when needed, but not too long
-    # ==============================================================
-    if energy < 3:
-        # Don't get stuck in WAIT loops — if waited 3+ turns, try to move
-        if match_state["consecutive_waits"] >= 3:
-            action = explore_move(my_x, my_y, arena_size, walls, safe_radius, enemies)
-            if action and energy >= 1:
-                return respond(action, "🔍", "breaking wait loop")
+    # ============================================================
+    # 10. ENERGY MANAGEMENT
+    # ============================================================
+    if energy < min_energy:
+        if consecutive_waits >= 4:
+            # Break wait loop
+            for action in ALL_MOVES:
+                nx, ny = apply_move(my_x, my_y, action)
+                if is_valid(nx, ny, arena_size, walls) and (nx, ny) not in positions[-3:]:
+                    return respond(action, "🔍", "breaking loop")
         return respond("WAIT", "🔋", "recharging")
 
-    # ==============================================================
-    # 10. EXPLORE — wander intelligently to find resources
-    # ==============================================================
-    action = explore_move(my_x, my_y, arena_size, walls, safe_radius, enemies)
-    if action and energy >= 1:
-        return respond(action, "🔍", "scouting")
+    # ============================================================
+    # 11. EXPLORE
+    # ============================================================
+    best_action = None
+    best_score = -9999
+    random.shuffle(ALL_MOVES)
 
-    return respond("WAIT", "😴", "nothing to do")
+    for action in ALL_MOVES:
+        nx, ny = apply_move(my_x, my_y, action)
+        if not is_valid(nx, ny, arena_size, walls):
+            continue
+        s = 0.0
+        if (nx, ny) in positions[-3:]: s -= 20
+        elif (nx, ny) in positions[-6:]: s -= 10
+        if is_in_safe_zone(nx, ny, arena_size, safe_radius): s += 8
+        else: s -= 12
+        s -= dist_from_center(nx, ny, arena_size) * center_w
+        for e in enemies:
+            if chebyshev(nx, ny, e["x"], e["y"]) <= 2: s -= 8
+        s += random.random() * 5
+        if s > best_score:
+            best_score = s
+            best_action = action
+
+    if best_action and energy >= 1:
+        return respond(best_action, "🔍", "exploring")
+
+    return respond("WAIT", "😴", "idle")
 
 
-# ===================================================================
+# =====================================================================
 # HTTP ENDPOINTS
-# ===================================================================
+# =====================================================================
 
 @app.post("/move")
 async def move(state: dict[str, Any]) -> MoveResponse:
+    global positions, prev_action, consecutive_waits, active_weights
+
+    match_id = state["match_id"]
+
+    # Detect new match → finish old one, start fresh
+    if match_id != current_match.get("match_id"):
+        if current_match.get("match_id"):
+            finish_match()
+
+        # Reset per-match state
+        positions = []
+        prev_action = ""
+        consecutive_waits = 0
+
+        # Get fresh weights (with exploration for this match)
+        active_weights = get_active_weights()
+        start_new_match(match_id, active_weights)
+
+    # Track this turn
+    track_turn(state)
+
+    # Make decision
     response = choose_action(state)
 
+    # Optional: send status to arena UI
     if ARENA_URL:
         try:
+            matches_info = f"M{total_matches}"
+            if total_matches > 0:
+                win_rate = int(total_wins / total_matches * 100)
+                matches_info += f" W{win_rate}%"
+
             async with httpx.AsyncClient() as client:
                 await client.post(
                     f"{ARENA_URL}/arena/bot-update",
                     json={
                         "bot_id": state["self"]["bot_id"],
-                        "status": response.mood.upper(),
-                        "message": f"T{state['turn']}: {response.action}",
+                        "status": f"{response.mood.upper()} [{matches_info}]",
+                        "message": f"T{state['turn']}: {response.action} | {matches_info}",
                         "color": BOT_COLOR,
                     },
                     timeout=0.3,
@@ -700,3 +801,18 @@ async def move(state: dict[str, Any]) -> MoveResponse:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "bot_id": BOT_ID}
+
+
+@app.get("/stats")
+async def stats() -> dict:
+    """Check learning progress — visit /stats to see how the bot is evolving."""
+    recent_rewards = [m["reward"] for m in match_history[-10:]] if match_history else []
+    return {
+        "total_matches": total_matches,
+        "total_wins": total_wins,
+        "win_rate": f"{total_wins / max(1, total_matches) * 100:.1f}%",
+        "matches_in_memory": len(match_history),
+        "current_weights": {k: round(v, 3) for k, v in strategy_weights.items()},
+        "recent_avg_reward": round(sum(recent_rewards) / max(1, len(recent_rewards)), 1),
+        "learning_rate": LEARNING_RATE,
+    }
